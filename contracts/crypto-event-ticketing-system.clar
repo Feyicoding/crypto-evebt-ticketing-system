@@ -753,4 +753,654 @@
 )
 
 ;; public functions
-;;
+
+;; =================
+;; Event Management
+;; =================
+
+;; Create a new event
+(define-public (create-event 
+  (name (string-ascii 100))
+  (description (string-ascii 500))
+  (venue (string-ascii 100))
+  (start-time uint)
+  (end-time uint)
+  (capacity uint)
+  (base-price uint)
+  (refund-enabled bool)
+  (transfer-enabled bool)
+  (metadata-uri (optional (string-ascii 200)))
+)
+  (let (
+    (event-id (get-next-event-id))
+    (organizer tx-sender)
+    (refund-deadline (calculate-refund-deadline start-time))
+  )
+    ;; Validation checks
+    (asserts! (not (is-contract-paused)) ERR-NOT-AUTHORIZED)
+    (asserts! (can-organizer-create-event organizer) ERR-TICKET-LIMIT-EXCEEDED)
+    (asserts! (is-valid-event-name name) ERR-INVALID-CAPACITY)
+    (asserts! (is-valid-event-description description) ERR-INVALID-CAPACITY)
+    (asserts! (is-valid-venue-name venue) ERR-INVALID-CAPACITY)
+    (asserts! (is-valid-event-duration start-time end-time) ERR-INVALID-DATE)
+    (asserts! (is-valid-capacity capacity) ERR-INVALID-CAPACITY)
+    (asserts! (is-valid-price base-price) ERR-INVALID-PRICE)
+    
+    ;; Create event record
+    (map-set events
+      { event-id: event-id }
+      {
+        organizer: organizer,
+        name: name,
+        description: description,
+        venue: venue,
+        start-time: start-time,
+        end-time: end-time,
+        capacity: capacity,
+        tickets-sold: u0,
+        status: EVENT-STATUS-CREATED,
+        created-at: block-height,
+        updated-at: block-height,
+        base-price: base-price,
+        refund-enabled: refund-enabled,
+        transfer-enabled: transfer-enabled,
+        refund-deadline: refund-deadline,
+        metadata-uri: metadata-uri
+      }
+    )
+    
+    ;; Initialize event revenue tracking
+    (map-set event-revenue
+      { event-id: event-id }
+      {
+        gross-revenue: u0,
+        platform-fees: u0,
+        organizer-fees: u0,
+        net-revenue: u0,
+        refunds-issued: u0,
+        transfers-revenue: u0
+      }
+    )
+    
+    ;; Update organizer profile
+    (match (map-get? organizers { organizer: organizer })
+      org-data
+        (map-set organizers
+          { organizer: organizer }
+          (merge org-data { events-created: (+ (get events-created org-data) u1) })
+        )
+      ;; Create new organizer profile if doesn't exist
+      (map-set organizers
+        { organizer: organizer }
+        {
+          name: "",
+          verified: false,
+          events-created: u1,
+          total-revenue: u0,
+          reputation-score: u100,
+          created-at: block-height,
+          contact-info: none,
+          website: none
+        }
+      )
+    )
+    
+    ;; Update global stats
+    (increment-total-events)
+    
+    (ok event-id)
+  )
+)
+
+;; Configure ticket types for an event
+(define-public (configure-ticket-type
+  (event-id uint)
+  (ticket-type uint)
+  (name (string-ascii 50))
+  (price uint)
+  (capacity uint)
+  (sale-start uint)
+  (sale-end uint)
+)
+  (begin
+    ;; Validation checks
+    (asserts! (not (is-contract-paused)) ERR-NOT-AUTHORIZED)
+    (asserts! (is-valid-event-id event-id) ERR-EVENT-NOT-FOUND)
+    (asserts! (is-event-organizer event-id tx-sender) ERR-NOT-AUTHORIZED)
+    (asserts! (is-valid-ticket-type ticket-type) ERR-INVALID-TICKET-TYPE)
+    (asserts! (is-valid-price price) ERR-INVALID-PRICE)
+    (asserts! (is-valid-capacity capacity) ERR-INVALID-CAPACITY)
+    (asserts! (> sale-end sale-start) ERR-INVALID-DATE)
+    
+    ;; Configure ticket type
+    (map-set ticket-types
+      { event-id: event-id, ticket-type: ticket-type }
+      {
+        name: name,
+        price: price,
+        capacity: capacity,
+        sold: u0,
+        sale-start: sale-start,
+        sale-end: sale-end,
+        enabled: true,
+        metadata: none
+      }
+    )
+    
+    (ok true)
+  )
+)
+
+;; Activate an event for ticket sales
+(define-public (activate-event (event-id uint))
+  (begin
+    ;; Validation checks
+    (asserts! (not (is-contract-paused)) ERR-NOT-AUTHORIZED)
+    (asserts! (is-valid-event-id event-id) ERR-EVENT-NOT-FOUND)
+    (asserts! (is-event-organizer event-id tx-sender) ERR-NOT-AUTHORIZED)
+    
+    ;; Update event status
+    (match (map-get? events { event-id: event-id })
+      event-data
+        (map-set events 
+          { event-id: event-id }
+          (merge event-data { 
+            status: EVENT-STATUS-ACTIVE,
+            updated-at: block-height
+          })
+        )
+      false
+    )
+    
+    (ok true)
+  )
+)
+
+;; =================
+;; Ticket Operations
+;; =================
+
+;; Purchase tickets (simplified to purchase one ticket at a time)
+(define-public (purchase-ticket
+  (event-id uint)
+  (ticket-type uint)
+)
+  (let (
+    (buyer tx-sender)
+    (ticket-price (match (map-get? ticket-types { event-id: event-id, ticket-type: ticket-type })
+      type-data (get price type-data)
+      u0
+    ))
+    (platform-fee (calculate-platform-fee ticket-price))
+    (organizer-fee (calculate-organizer-fee ticket-price))
+    (net-amount (calculate-net-amount-after-fees ticket-price))
+  )
+    ;; Validation checks
+    (asserts! (not (is-contract-paused)) ERR-NOT-AUTHORIZED)
+    (asserts! (is-valid-event-id event-id) ERR-EVENT-NOT-FOUND)
+    (asserts! (is-event-active event-id) ERR-EVENT-NOT-ACTIVE)
+    (asserts! (is-event-not-expired event-id) ERR-EVENT-EXPIRED)
+    (asserts! (is-valid-ticket-type ticket-type) ERR-INVALID-TICKET-TYPE)
+    (asserts! (is-sale-period-active event-id ticket-type) ERR-EVENT-NOT-ACTIVE)
+    (asserts! (not (is-ticket-type-sold-out event-id ticket-type)) ERR-EVENT-SOLD-OUT)
+    (asserts! (can-user-purchase-tickets buyer u1) ERR-TICKET-LIMIT-EXCEEDED)
+    (asserts! (> ticket-price u0) ERR-INVALID-PRICE)
+    
+    ;; Process payment (STX transfer)
+    (try! (stx-transfer? ticket-price buyer (var-get platform-fee-recipient)))
+    
+    ;; Create a single ticket
+    (let (
+      (ticket-id (get-next-ticket-id))
+      (qr-hash (generate-qr-code-hash ticket-id block-height))
+    )
+      ;; Create ticket record
+      (map-set tickets
+        { ticket-id: ticket-id }
+        {
+          event-id: event-id,
+          ticket-type: ticket-type,
+          owner: buyer,
+          original-buyer: buyer,
+          purchase-price: ticket-price,
+          purchase-time: block-height,
+          status: TICKET-STATUS-SOLD,
+          used-at: none,
+          qr-code-hash: qr-hash,
+          seat-number: none,
+          metadata: none
+        }
+      )
+      
+      ;; Set user ticket ownership
+      (map-set user-tickets
+        { user: buyer, ticket-id: ticket-id }
+        { owned: true }
+      )
+      
+      ;; Create QR verification record
+      (map-set ticket-verification
+        { qr-code-hash: qr-hash }
+        {
+          ticket-id: ticket-id,
+          generated-at: block-height,
+          expires-at: (+ block-height u4320), ;; 30 days
+          used: false
+        }
+      )
+      
+      ;; Update ticket type sold count
+      (match (map-get? ticket-types { event-id: event-id, ticket-type: ticket-type })
+        type-data
+          (map-set ticket-types
+            { event-id: event-id, ticket-type: ticket-type }
+            (merge type-data { sold: (+ (get sold type-data) u1) })
+          )
+        false
+      )
+      
+      ;; Update event tickets sold
+      (match (map-get? events { event-id: event-id })
+        event-data
+          (map-set events
+            { event-id: event-id }
+            (merge event-data { 
+              tickets-sold: (+ (get tickets-sold event-data) u1),
+              updated-at: block-height
+            })
+          )
+        false
+      )
+      
+      ;; Update user profile
+      (match (map-get? user-profiles { user: buyer })
+        profile
+          (map-set user-profiles
+            { user: buyer }
+            (merge profile { 
+              total-tickets-purchased: (+ (get total-tickets-purchased profile) u1),
+              last-activity: block-height
+            })
+          )
+        ;; Create new user profile
+        (map-set user-profiles
+          { user: buyer }
+          {
+            name: none,
+            email-hash: none,
+            total-tickets-purchased: u1,
+            total-events-attended: u0,
+            reputation-score: u100,
+            created-at: block-height,
+            last-activity: block-height,
+            verified: false
+          }
+        )
+      )
+      
+      ;; Update revenue tracking
+      (distribute-revenue event-id ticket-price)
+      (add-to-total-revenue ticket-price)
+      (increment-total-tickets-sold)
+      
+      (ok ticket-id)
+    )
+  )
+)
+
+;; Helper function for creating individual tickets
+(define-private (create-single-ticket (ticket-id uint) (event-id uint) (ticket-type uint) (buyer principal) (price uint))
+  (let (
+    (qr-hash (generate-qr-code-hash ticket-id block-height))
+  )
+    ;; Create ticket record
+    (map-set tickets
+      { ticket-id: ticket-id }
+      {
+        event-id: event-id,
+        ticket-type: ticket-type,
+        owner: buyer,
+        original-buyer: buyer,
+        purchase-price: price,
+        purchase-time: block-height,
+        status: TICKET-STATUS-SOLD,
+        used-at: none,
+        qr-code-hash: qr-hash,
+        seat-number: none,
+        metadata: none
+      }
+    )
+    
+    ;; Set user ticket ownership
+    (map-set user-tickets
+      { user: buyer, ticket-id: ticket-id }
+      { owned: true }
+    )
+    
+    ;; Create QR verification record
+    (map-set ticket-verification
+      { qr-code-hash: qr-hash }
+      {
+        ticket-id: ticket-id,
+        generated-at: block-height,
+        expires-at: (+ block-height u4320), ;; 30 days
+        used: false
+      }
+    )
+    
+    ticket-id
+  )
+)
+
+;; Transfer ticket to another user
+(define-public (transfer-ticket (ticket-id uint) (to principal))
+  (let (
+    (from tx-sender)
+    (ticket-data (unwrap! (map-get? tickets { ticket-id: ticket-id }) ERR-TICKET-NOT-FOUND))
+    (event-id (get event-id ticket-data))
+    (transfer-fee (calculate-transfer-fee (get purchase-price ticket-data)))
+  )
+    ;; Validation checks
+    (asserts! (not (is-contract-paused)) ERR-NOT-AUTHORIZED)
+    (asserts! (is-ticket-owner ticket-id from) ERR-NOT-AUTHORIZED)
+    (asserts! (not (is-eq from to)) ERR-NOT-AUTHORIZED)
+    (asserts! (is-eq (get status ticket-data) TICKET-STATUS-SOLD) ERR-TICKET-ALREADY-USED)
+    
+    ;; Check if event allows transfers
+    (match (map-get? events { event-id: event-id })
+      event-data (asserts! (get transfer-enabled event-data) ERR-TRANSFER-NOT-ALLOWED)
+      false
+    )
+    
+    ;; Process transfer fee if applicable
+    (if (> transfer-fee u0)
+      (try! (stx-transfer? transfer-fee from (var-get platform-fee-recipient)))
+      true
+    )
+    
+    ;; Update ticket ownership
+    (map-set tickets
+      { ticket-id: ticket-id }
+      (merge ticket-data {
+        owner: to,
+        status: TICKET-STATUS-TRANSFERRED
+      })
+    )
+    
+    ;; Update user ticket mappings
+    (map-delete user-tickets { user: from, ticket-id: ticket-id })
+    (map-set user-tickets { user: to, ticket-id: ticket-id } { owned: true })
+    
+    ;; Create transfer record
+    (create-transfer-record ticket-id from to transfer-fee)
+    
+    ;; Update user profiles
+    (match (map-get? user-profiles { user: to })
+      profile
+        (map-set user-profiles
+          { user: to }
+          (merge profile { 
+            total-tickets-purchased: (+ (get total-tickets-purchased profile) u1),
+            last-activity: block-height
+          })
+        )
+      ;; Create profile for new user
+      (map-set user-profiles
+        { user: to }
+        {
+          name: none,
+          email-hash: none,
+          total-tickets-purchased: u1,
+          total-events-attended: u0,
+          reputation-score: u100,
+          created-at: block-height,
+          last-activity: block-height,
+          verified: false
+        }
+      )
+    )
+    
+    (ok true)
+  )
+)
+
+;; Request refund for a ticket (simplified)
+(define-public (request-refund (ticket-id uint))
+  (let (
+    (requester tx-sender)
+    (ticket-data (unwrap! (map-get? tickets { ticket-id: ticket-id }) ERR-TICKET-NOT-FOUND))
+    (event-id (get event-id ticket-data))
+    (refund-amount (get purchase-price ticket-data))
+    (refund-fee (calculate-refund-fee refund-amount))
+    (net-refund (- refund-amount refund-fee))
+  )
+    ;; Validation checks
+    (asserts! (not (is-contract-paused)) ERR-NOT-AUTHORIZED)
+    (asserts! (is-ticket-owner ticket-id requester) ERR-NOT-AUTHORIZED)
+    (asserts! (is-eq (get status ticket-data) TICKET-STATUS-SOLD) ERR-TICKET-ALREADY-USED)
+    (asserts! (is-within-refund-window event-id) ERR-REFUND-NOT-ALLOWED)
+    
+    ;; Check if event allows refunds
+    (match (map-get? events { event-id: event-id })
+      event-data (asserts! (get refund-enabled event-data) ERR-REFUND-NOT-ALLOWED)
+      false
+    )
+    
+    ;; Create refund request
+    (map-set refund-requests
+      { ticket-id: ticket-id }
+      {
+        requester: requester,
+        request-time: block-height,
+        reason: "Refund requested",
+        status: u0, ;; pending
+        processed-at: none,
+        refund-amount: net-refund,
+        admin-notes: none
+      }
+    )
+    
+    (ok net-refund)
+  )
+)
+
+;; =================
+;; Event Operations
+;; =================
+
+;; Validate and use a ticket (check-in)
+(define-public (validate-ticket (ticket-id uint) (qr-hash (buff 32)))
+  (let (
+    (validator tx-sender)
+    (ticket-data (unwrap! (map-get? tickets { ticket-id: ticket-id }) ERR-TICKET-NOT-FOUND))
+    (event-id (get event-id ticket-data))
+    (ticket-owner (get owner ticket-data))
+  )
+    ;; Validation checks
+    (asserts! (not (is-contract-paused)) ERR-NOT-AUTHORIZED)
+    (asserts! (is-validator event-id validator) ERR-NOT-AUTHORIZED)
+    (asserts! (is-eq (get status ticket-data) TICKET-STATUS-SOLD) ERR-TICKET-ALREADY-USED)
+    (asserts! (is-valid-qr-code qr-hash ticket-id) ERR-VERIFICATION-FAILED)
+    
+    ;; Mark ticket as used
+    (map-set tickets
+      { ticket-id: ticket-id }
+      (merge ticket-data {
+        status: TICKET-STATUS-USED,
+        used-at: (some block-height)
+      })
+    )
+    
+    ;; Mark QR code as used
+    (match (map-get? ticket-verification { qr-code-hash: qr-hash })
+      verification-data
+        (map-set ticket-verification
+          { qr-code-hash: qr-hash }
+          (merge verification-data { used: true })
+        )
+      false
+    )
+    
+    ;; Record attendance
+    (map-set event-attendance
+      { event-id: event-id, user: ticket-owner }
+      {
+        attended: true,
+        check-in-time: (some block-height),
+        check-out-time: none,
+        validator: (some validator)
+      }
+    )
+    
+    ;; Update user stats
+    (match (map-get? user-profiles { user: ticket-owner })
+      profile
+        (map-set user-profiles
+          { user: ticket-owner }
+          (merge profile { 
+            total-events-attended: (+ (get total-events-attended profile) u1),
+            last-activity: block-height
+          })
+        )
+      false
+    )
+    
+    (ok true)
+  )
+)
+
+;; =================
+;; Administrative Functions
+;; =================
+
+;; Add validator for an event
+(define-public (add-event-validator (event-id uint) (new-validator principal))
+  (let (
+    (validator-key { event-id: event-id, validator: new-validator })
+  )
+    ;; Validation checks
+    (asserts! (not (is-contract-paused)) ERR-NOT-AUTHORIZED)
+    (asserts! (is-valid-event-id event-id) ERR-EVENT-NOT-FOUND)
+    (asserts! (is-event-organizer event-id tx-sender) ERR-NOT-AUTHORIZED)
+    
+    ;; Add validator
+    (map-set event-validators
+      validator-key
+      { authorized: true, added-at: block-height }
+    )
+    
+    (ok true)
+  )
+)
+
+;; Approve refund request (admin only)
+(define-public (approve-refund (target-ticket-id uint))
+  (let (
+    (admin tx-sender)
+    (refund-request (unwrap! (map-get? refund-requests { ticket-id: target-ticket-id }) ERR-TICKET-NOT-FOUND))
+    (refund-amount (get refund-amount refund-request))
+    (requester (get requester refund-request))
+    (refund-key { ticket-id: target-ticket-id })
+    (ticket-key { ticket-id: target-ticket-id })
+  )
+    ;; Validation checks
+    (asserts! (not (is-contract-paused)) ERR-NOT-AUTHORIZED)
+    (asserts! (is-admin admin) ERR-NOT-AUTHORIZED)
+    (asserts! (is-eq (get status refund-request) u0) ERR-REFUND-NOT-ALLOWED) ;; pending
+    
+    ;; Process refund
+    (try! (stx-transfer? refund-amount (var-get platform-fee-recipient) requester))
+    
+    ;; Update refund request status
+    (map-set refund-requests
+      refund-key
+      (merge refund-request {
+        status: u3, ;; processed
+        processed-at: (some block-height),
+        admin-notes: none
+      })
+    )
+    
+    ;; Update ticket status
+    (match (map-get? tickets ticket-key)
+      ticket-data
+        (map-set tickets
+          ticket-key
+          (merge ticket-data { status: TICKET-STATUS-REFUNDED })
+        )
+      false
+    )
+    
+    (ok refund-amount)
+  )
+)
+
+;; Pause/unpause contract (admin only)
+(define-public (set-contract-pause (paused bool))
+  (begin
+    (asserts! (is-admin tx-sender) ERR-NOT-AUTHORIZED)
+    (var-set contract-paused paused)
+    (ok paused)
+  )
+)
+
+;; Set user role (admin only)
+(define-public (set-user-role (target-user principal) (role uint))
+  (let (
+    (user-key { user: target-user })
+  )
+    (asserts! (is-admin tx-sender) ERR-NOT-AUTHORIZED)
+    (asserts! (<= role ROLE-VALIDATOR) ERR-NOT-AUTHORIZED)
+    
+    (map-set user-roles
+      user-key
+      { role: role }
+    )
+    
+    (ok true)
+  )
+)
+
+;; =================
+;; Read-only Functions
+;; =================
+
+;; Get event details
+(define-read-only (get-event (event-id uint))
+  (map-get? events { event-id: event-id })
+)
+
+;; Get ticket details
+(define-read-only (get-ticket (ticket-id uint))
+  (map-get? tickets { ticket-id: ticket-id })
+)
+
+;; Get user profile
+(define-read-only (get-user-profile (user principal))
+  (map-get? user-profiles { user: user })
+)
+
+;; Get event revenue
+(define-read-only (get-event-revenue (event-id uint))
+  (map-get? event-revenue { event-id: event-id })
+)
+
+;; Get ticket type info
+(define-read-only (get-ticket-type (event-id uint) (ticket-type uint))
+  (map-get? ticket-types { event-id: event-id, ticket-type: ticket-type })
+)
+
+;; Check if user owns ticket
+(define-read-only (owns-ticket (user principal) (ticket-id uint))
+  (is-some (map-get? user-tickets { user: user, ticket-id: ticket-id }))
+)
+
+;; Get contract stats
+(define-read-only (get-contract-stats)
+  {
+    total-events: (var-get total-events-created),
+    total-tickets-sold: (var-get total-tickets-sold),
+    total-revenue: (var-get total-revenue),
+    contract-paused: (var-get contract-paused)
+  }
+)
