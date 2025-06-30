@@ -350,7 +350,407 @@
 )
 
 ;; private functions
-;;
+
+;; Validation functions
+(define-private (is-valid-event-id (event-id uint))
+  (is-some (map-get? events { event-id: event-id }))
+)
+
+(define-private (is-valid-ticket-id (ticket-id uint))
+  (is-some (map-get? tickets { ticket-id: ticket-id }))
+)
+
+(define-private (is-event-organizer (event-id uint) (user principal))
+  (match (map-get? events { event-id: event-id })
+    event-data (is-eq (get organizer event-data) user)
+    false
+  )
+)
+
+(define-private (is-ticket-owner (ticket-id uint) (user principal))
+  (match (map-get? tickets { ticket-id: ticket-id })
+    ticket-data (is-eq (get owner ticket-data) user)
+    false
+  )
+)
+
+(define-private (is-admin (user principal))
+  (match (map-get? user-roles { user: user })
+    role-data (is-eq (get role role-data) ROLE-ADMIN)
+    false
+  )
+)
+
+(define-private (is-validator (event-id uint) (user principal))
+  (match (map-get? event-validators { event-id: event-id, validator: user })
+    validator-data (get authorized validator-data)
+    false
+  )
+)
+
+(define-private (is-contract-paused)
+  (var-get contract-paused)
+)
+
+(define-private (is-event-active (event-id uint))
+  (match (map-get? events { event-id: event-id })
+    event-data (is-eq (get status event-data) EVENT-STATUS-ACTIVE)
+    false
+  )
+)
+
+(define-private (is-event-not-expired (event-id uint))
+  (match (map-get? events { event-id: event-id })
+    event-data (> (get start-time event-data) block-height)
+    false
+  )
+)
+
+(define-private (is-valid-ticket-type (ticket-type uint))
+  (or 
+    (is-eq ticket-type TICKET-TYPE-GENERAL)
+    (or 
+      (is-eq ticket-type TICKET-TYPE-VIP)
+      (or 
+        (is-eq ticket-type TICKET-TYPE-PREMIUM)
+        (is-eq ticket-type TICKET-TYPE-BACKSTAGE)
+      )
+    )
+  )
+)
+
+(define-private (is-valid-price (price uint))
+  (and 
+    (>= price MIN-TICKET-PRICE)
+    (<= price MAX-TICKET-PRICE)
+  )
+)
+
+(define-private (is-valid-capacity (capacity uint))
+  (and 
+    (> capacity u0)
+    (<= capacity MAX-EVENT-CAPACITY)
+  )
+)
+
+(define-private (is-valid-event-duration (start-time uint) (end-time uint))
+  (let (
+    (duration (- end-time start-time))
+  )
+    (and 
+      (>= duration MIN-EVENT-DURATION)
+      (<= duration MAX-EVENT-DURATION)
+      (> start-time block-height)
+    )
+  )
+)
+
+;; Fee calculation functions
+(define-private (calculate-platform-fee (amount uint))
+  (/ (* amount PLATFORM-FEE-BPS) u10000)
+)
+
+(define-private (calculate-organizer-fee (amount uint))
+  (/ (* amount ORGANIZER-FEE-BPS) u10000)
+)
+
+(define-private (calculate-refund-fee (amount uint))
+  (/ (* amount REFUND-FEE-BPS) u10000)
+)
+
+(define-private (calculate-transfer-fee (amount uint))
+  (/ (* amount TRANSFER-FEE-BPS) u10000)
+)
+
+(define-private (calculate-revenue-shares (gross-revenue uint))
+  {
+    artist-share: (/ (* gross-revenue ARTIST-SHARE-BPS) u10000),
+    venue-share: (/ (* gross-revenue VENUE-SHARE-BPS) u10000),
+    platform-share: (/ (* gross-revenue PLATFORM-SHARE-BPS) u10000)
+  }
+)
+
+(define-private (calculate-net-amount-after-fees (gross-amount uint))
+  (let (
+    (platform-fee (calculate-platform-fee gross-amount))
+    (organizer-fee (calculate-organizer-fee gross-amount))
+  )
+    (- gross-amount (+ platform-fee organizer-fee))
+  )
+)
+
+;; QR code and verification functions
+(define-private (generate-qr-code-hash (ticket-id uint) (timestamp uint))
+  ;; Simple hash generation using available data
+  (hash160 0x000000000000000000000000000000000000000000000000000000000000000000000000)
+)
+
+(define-private (is-valid-qr-code (qr-hash (buff 32)) (ticket-id uint))
+  (match (map-get? ticket-verification { qr-code-hash: qr-hash })
+    verification-data 
+      (and 
+        (is-eq (get ticket-id verification-data) ticket-id)
+        (not (get used verification-data))
+        (> (get expires-at verification-data) block-height)
+      )
+    false
+  )
+)
+
+;; Ticket availability and capacity functions
+(define-private (get-event-tickets-sold (event-id uint))
+  (match (map-get? events { event-id: event-id })
+    event-data (get tickets-sold event-data)
+    u0
+  )
+)
+
+(define-private (get-event-capacity (event-id uint))
+  (match (map-get? events { event-id: event-id })
+    event-data (get capacity event-data)
+    u0
+  )
+)
+
+(define-private (is-event-sold-out (event-id uint))
+  (let (
+    (tickets-sold (get-event-tickets-sold event-id))
+    (capacity (get-event-capacity event-id))
+  )
+    (>= tickets-sold capacity)
+  )
+)
+
+(define-private (get-ticket-type-sold (event-id uint) (ticket-type uint))
+  (match (map-get? ticket-types { event-id: event-id, ticket-type: ticket-type })
+    type-data (get sold type-data)
+    u0
+  )
+)
+
+(define-private (get-ticket-type-capacity (event-id uint) (ticket-type uint))
+  (match (map-get? ticket-types { event-id: event-id, ticket-type: ticket-type })
+    type-data (get capacity type-data)
+    u0
+  )
+)
+
+(define-private (is-ticket-type-sold-out (event-id uint) (ticket-type uint))
+  (let (
+    (sold (get-ticket-type-sold event-id ticket-type))
+    (capacity (get-ticket-type-capacity event-id ticket-type))
+  )
+    (>= sold capacity)
+  )
+)
+
+;; User limit checking functions
+(define-private (get-user-ticket-count (user principal))
+  (match (map-get? user-profiles { user: user })
+    profile (get total-tickets-purchased profile)
+    u0
+  )
+)
+
+(define-private (can-user-purchase-tickets (user principal) (quantity uint))
+  (let (
+    (current-count (get-user-ticket-count user))
+    (new-total (+ current-count quantity))
+  )
+    (<= new-total MAX-TICKETS-PER-USER)
+  )
+)
+
+(define-private (get-organizer-event-count (organizer principal))
+  (match (map-get? organizers { organizer: organizer })
+    org-data (get events-created org-data)
+    u0
+  )
+)
+
+(define-private (can-organizer-create-event (organizer principal))
+  (< (get-organizer-event-count organizer) MAX-EVENTS-PER-ORGANIZER)
+)
+
+;; Time and deadline functions
+(define-private (is-within-refund-window (event-id uint))
+  (match (map-get? events { event-id: event-id })
+    event-data 
+      (let (
+        (refund-deadline (get refund-deadline event-data))
+        (current-time block-height)
+      )
+        (> refund-deadline current-time)
+      )
+    false
+  )
+)
+
+(define-private (calculate-refund-deadline (start-time uint))
+  (- start-time REFUND-DEADLINE)
+)
+
+(define-private (is-sale-period-active (event-id uint) (ticket-type uint))
+  (match (map-get? ticket-types { event-id: event-id, ticket-type: ticket-type })
+    type-data 
+      (let (
+        (sale-start (get sale-start type-data))
+        (sale-end (get sale-end type-data))
+        (current-time block-height)
+      )
+        (and 
+          (>= current-time sale-start)
+          (<= current-time sale-end)
+          (get enabled type-data)
+        )
+      )
+    false
+  )
+)
+
+;; String validation functions
+(define-private (is-valid-string-length (str (string-ascii 500)) (max-length uint))
+  (<= (len str) max-length)
+)
+
+(define-private (is-valid-event-name (name (string-ascii 100)))
+  (and 
+    (> (len name) u0)
+    (is-valid-string-length name MAX-EVENT-NAME-LENGTH)
+  )
+)
+
+(define-private (is-valid-event-description (description (string-ascii 500)))
+  (is-valid-string-length description MAX-EVENT-DESCRIPTION-LENGTH)
+)
+
+(define-private (is-valid-venue-name (venue (string-ascii 100)))
+  (and 
+    (> (len venue) u0)
+    (is-valid-string-length venue MAX-VENUE-NAME-LENGTH)
+  )
+)
+
+;; Increment functions for IDs
+(define-private (get-next-event-id)
+  (let (
+    (current-id (var-get next-event-id))
+  )
+    (var-set next-event-id (+ current-id u1))
+    current-id
+  )
+)
+
+(define-private (get-next-ticket-id)
+  (let (
+    (current-id (var-get next-ticket-id))
+  )
+    (var-set next-ticket-id (+ current-id u1))
+    current-id
+  )
+)
+
+;; Update functions for statistics
+(define-private (increment-total-events)
+  (var-set total-events-created (+ (var-get total-events-created) u1))
+)
+
+(define-private (increment-total-tickets-sold)
+  (var-set total-tickets-sold (+ (var-get total-tickets-sold) u1))
+)
+
+(define-private (add-to-total-revenue (amount uint))
+  (var-set total-revenue (+ (var-get total-revenue) amount))
+)
+
+;; Revenue distribution helper
+(define-private (distribute-revenue (event-id uint) (amount uint))
+  (let (
+    (shares (calculate-revenue-shares amount))
+    (current-revenue (unwrap-panic (map-get? event-revenue { event-id: event-id })))
+  )
+    (map-set event-revenue 
+      { event-id: event-id }
+      (merge current-revenue {
+        gross-revenue: (+ (get gross-revenue current-revenue) amount),
+        net-revenue: (+ (get net-revenue current-revenue) (get artist-share shares))
+      })
+    )
+  )
+)
+
+;; Transfer helper functions
+(define-private (create-transfer-record (ticket-id uint) (from principal) (to principal) (fee uint))
+  (let (
+    (transfer-id (+ (get-ticket-type-sold u0 u0) u1)) ;; Simple transfer ID generation
+  )
+    (map-set ticket-transfers
+      { ticket-id: ticket-id, transfer-id: transfer-id }
+      {
+        from: from,
+        to: to,
+        transfer-time: block-height,
+        transfer-fee: fee,
+        reason: none
+      }
+    )
+  )
+)
+
+;; Waitlist management helpers
+(define-private (get-waitlist-position (event-id uint) (user principal))
+  (match (map-get? event-waitlist { event-id: event-id, user: user })
+    waitlist-data (get position waitlist-data)
+    u0
+  )
+)
+
+(define-private (add-to-waitlist (event-id uint) (user principal) (ticket-type-preference (optional uint)))
+  (let (
+    (position (+ (get-waitlist-position event-id user) u1))
+  )
+    (map-set event-waitlist
+      { event-id: event-id, user: user }
+      {
+        joined-at: block-height,
+        position: position,
+        notified: false,
+        ticket-type-preference: ticket-type-preference
+      }
+    )
+  )
+)
+
+;; Reputation and scoring helpers
+(define-private (update-user-reputation (user principal) (score-change int))
+  (match (map-get? user-profiles { user: user })
+    profile 
+      (let (
+        (current-score (get reputation-score profile))
+        (new-score (+ current-score (if (> score-change 0) (to-uint score-change) u0)))
+      )
+        (map-set user-profiles
+          { user: user }
+          (merge profile { reputation-score: new-score })
+        )
+      )
+    false
+  )
+)
+
+(define-private (update-organizer-stats (organizer principal) (revenue-added uint))
+  (match (map-get? organizers { organizer: organizer })
+    org-data
+      (map-set organizers
+        { organizer: organizer }
+        (merge org-data {
+          total-revenue: (+ (get total-revenue org-data) revenue-added),
+          events-created: (+ (get events-created org-data) u1)
+        })
+      )
+    false
+  )
+)
 
 ;; public functions
 ;;
