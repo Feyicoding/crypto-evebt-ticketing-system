@@ -103,7 +103,251 @@
 (define-constant PLATFORM-SHARE-BPS u1000) ;; 10%
 
 ;; data maps and vars
-;;
+
+;; Global variables
+(define-data-var next-event-id uint u1)
+(define-data-var next-ticket-id uint u1)
+(define-data-var contract-paused bool false)
+(define-data-var platform-fee-recipient principal CONTRACT-OWNER)
+(define-data-var total-events-created uint u0)
+(define-data-var total-tickets-sold uint u0)
+(define-data-var total-revenue uint u0)
+
+;; Event data structure
+(define-map events
+  { event-id: uint }
+  {
+    organizer: principal,
+    name: (string-ascii 100),
+    description: (string-ascii 500),
+    venue: (string-ascii 100),
+    start-time: uint,
+    end-time: uint,
+    capacity: uint,
+    tickets-sold: uint,
+    status: uint,
+    created-at: uint,
+    updated-at: uint,
+    base-price: uint,
+    refund-enabled: bool,
+    transfer-enabled: bool,
+    refund-deadline: uint,
+    metadata-uri: (optional (string-ascii 200))
+  }
+)
+
+;; Ticket type configurations per event
+(define-map ticket-types
+  { event-id: uint, ticket-type: uint }
+  {
+    name: (string-ascii 50),
+    price: uint,
+    capacity: uint,
+    sold: uint,
+    sale-start: uint,
+    sale-end: uint,
+    enabled: bool,
+    metadata: (optional (string-ascii 200))
+  }
+)
+
+;; Individual ticket data
+(define-map tickets
+  { ticket-id: uint }
+  {
+    event-id: uint,
+    ticket-type: uint,
+    owner: principal,
+    original-buyer: principal,
+    purchase-price: uint,
+    purchase-time: uint,
+    status: uint,
+    used-at: (optional uint),
+    qr-code-hash: (buff 32),
+    seat-number: (optional (string-ascii 20)),
+    metadata: (optional (string-ascii 200))
+  }
+)
+
+;; User profiles and stats
+(define-map user-profiles
+  { user: principal }
+  {
+    name: (optional (string-ascii 50)),
+    email-hash: (optional (buff 32)),
+    total-tickets-purchased: uint,
+    total-events-attended: uint,
+    reputation-score: uint,
+    created-at: uint,
+    last-activity: uint,
+    verified: bool
+  }
+)
+
+;; User ticket ownership tracking
+(define-map user-tickets
+  { user: principal, ticket-id: uint }
+  { owned: bool }
+)
+
+;; Event organizer data
+(define-map organizers
+  { organizer: principal }
+  {
+    name: (string-ascii 50),
+    verified: bool,
+    events-created: uint,
+    total-revenue: uint,
+    reputation-score: uint,
+    created-at: uint,
+    contact-info: (optional (string-ascii 100)),
+    website: (optional (string-ascii 100))
+  }
+)
+
+;; Event attendance tracking
+(define-map event-attendance
+  { event-id: uint, user: principal }
+  {
+    attended: bool,
+    check-in-time: (optional uint),
+    check-out-time: (optional uint),
+    validator: (optional principal)
+  }
+)
+
+;; Ticket transfer history
+(define-map ticket-transfers
+  { ticket-id: uint, transfer-id: uint }
+  {
+    from: principal,
+    to: principal,
+    transfer-time: uint,
+    transfer-fee: uint,
+    reason: (optional (string-ascii 100))
+  }
+)
+
+;; Refund requests and processing
+(define-map refund-requests
+  { ticket-id: uint }
+  {
+    requester: principal,
+    request-time: uint,
+    reason: (string-ascii 200),
+    status: uint, ;; 0: pending, 1: approved, 2: rejected, 3: processed
+    processed-at: (optional uint),
+    refund-amount: uint,
+    admin-notes: (optional (string-ascii 200))
+  }
+)
+
+;; Revenue tracking per event
+(define-map event-revenue
+  { event-id: uint }
+  {
+    gross-revenue: uint,
+    platform-fees: uint,
+    organizer-fees: uint,
+    net-revenue: uint,
+    refunds-issued: uint,
+    transfers-revenue: uint
+  }
+)
+
+;; Admin and validator roles
+(define-map user-roles
+  { user: principal }
+  { role: uint }
+)
+
+;; Event validation and check-in validators
+(define-map event-validators
+  { event-id: uint, validator: principal }
+  { authorized: bool, added-at: uint }
+)
+
+;; Ticket verification codes (for QR code validation)
+(define-map ticket-verification
+  { qr-code-hash: (buff 32) }
+  {
+    ticket-id: uint,
+    generated-at: uint,
+    expires-at: uint,
+    used: bool
+  }
+)
+
+;; Event categories and tags
+(define-map event-categories
+  { event-id: uint, category: (string-ascii 30) }
+  { assigned: bool }
+)
+
+;; Waitlist for sold-out events
+(define-map event-waitlist
+  { event-id: uint, user: principal }
+  {
+    joined-at: uint,
+    position: uint,
+    notified: bool,
+    ticket-type-preference: (optional uint)
+  }
+)
+
+;; Pricing tiers and dynamic pricing
+(define-map pricing-tiers
+  { event-id: uint, tier: uint }
+  {
+    tier-name: (string-ascii 30),
+    base-price: uint,
+    price-multiplier: uint, ;; basis points
+    capacity-threshold: uint,
+    active: bool
+  }
+)
+
+;; Event reviews and ratings
+(define-map event-reviews
+  { event-id: uint, reviewer: principal }
+  {
+    rating: uint, ;; 1-5 stars
+    review-text: (optional (string-ascii 300)),
+    reviewed-at: uint,
+    verified-attendee: bool
+  }
+)
+
+;; System configuration and settings
+(define-map system-config
+  { key: (string-ascii 30) }
+  { value: (string-ascii 100) }
+)
+
+;; Emergency pause functionality per event
+(define-map event-emergency-status
+  { event-id: uint }
+  {
+    paused: bool,
+    paused-at: (optional uint),
+    paused-by: (optional principal),
+    reason: (optional (string-ascii 200))
+  }
+)
+
+;; Ticket resale marketplace
+(define-map ticket-resale
+  { ticket-id: uint }
+  {
+    seller: principal,
+    asking-price: uint,
+    listed-at: uint,
+    expires-at: uint,
+    sold: bool,
+    buyer: (optional principal),
+    platform-fee: uint
+  }
+)
 
 ;; private functions
 ;;
